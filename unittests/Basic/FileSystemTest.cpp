@@ -24,6 +24,9 @@
 
 #include "gtest/gtest.h"
 
+#include <chrono>
+#include <vector>
+
 using namespace llbuild;
 using namespace llbuild::basic;
 
@@ -221,5 +224,133 @@ TEST(ChecksumOnlyFileSystem, basic) {
   auto ec = llvm::sys::fs::remove(tempPath.str());
   EXPECT_FALSE(ec);
 }
+
+#if defined(_WIN32)
+TEST(FileSystemTest, widenPathPerformance) {
+  // Performance test for widenPath function on Windows
+  using namespace std::chrono;
+  
+  // Test data: various path types that exercise different code paths
+  std::vector<std::string> testPaths = {
+    // Short absolute paths (should hit early return optimization)
+    "C:\\Windows\\System32\\kernel32.dll",
+    "C:\\Program Files\\test.exe",
+    "D:\\temp\\file.txt",
+    
+    // Relative paths (require current directory lookup)
+    "..\\..\\test.txt",
+    "src\\main.cpp",
+    "build\\debug\\output.exe",
+    
+    // Long paths that require \\?\ prefix
+    "C:\\very\\long\\path\\that\\exceeds\\the\\normal\\MAX_PATH\\limit\\and\\requires\\special\\handling\\with\\the\\long\\path\\prefix\\to\\work\\correctly\\on\\windows\\systems\\file.txt",
+    
+    // Paths with . and .. components (require canonicalization)
+    "C:\\Windows\\..\\Program Files\\..\\Windows\\System32\\kernel32.dll",
+    "..\\src\\..\\build\\..\\src\\main.cpp",
+    
+    // UNC paths
+    "\\\\server\\share\\file.txt",
+    
+    // Already prefixed paths
+    "\\\\?\\C:\\already\\prefixed\\path.txt"
+  };
+  
+  const int iterations = 1000;
+  
+  // Warm up
+  for (const auto& path : testPaths) {
+    llvm::SmallVector<wchar_t, 260> result;
+    llvm::sys::path::widenPath(path, result);
+  }
+  
+  // Measure performance
+  auto start = high_resolution_clock::now();
+  
+  for (int i = 0; i < iterations; ++i) {
+    for (const auto& path : testPaths) {
+      llvm::SmallVector<wchar_t, 260> result;
+      std::error_code ec = llvm::sys::path::widenPath(path, result);
+      EXPECT_FALSE(ec) << "Failed to widen path: " << path;
+    }
+  }
+  
+  auto end = high_resolution_clock::now();
+  auto duration = duration_cast<microseconds>(end - start);
+  
+  double avgTimePerCall = static_cast<double>(duration.count()) / (iterations * testPaths.size());
+  
+  // Print performance results
+  std::cout << "\nwidenPath Performance Results:\n";
+  std::cout << "Total iterations: " << iterations << "\n";
+  std::cout << "Test paths: " << testPaths.size() << "\n";
+  std::cout << "Total calls: " << (iterations * testPaths.size()) << "\n";
+  std::cout << "Total time: " << duration.count() << " microseconds\n";
+  std::cout << "Average time per call: " << avgTimePerCall << " microseconds\n";
+  
+  // Performance expectations (these are reasonable targets)
+  EXPECT_LT(avgTimePerCall, 50.0) << "widenPath is taking too long on average";
+  
+  // Test correctness of results
+  for (const auto& path : testPaths) {
+    llvm::SmallVector<wchar_t, 260> result;
+    std::error_code ec = llvm::sys::path::widenPath(path, result);
+    EXPECT_FALSE(ec) << "widenPath failed for: " << path;
+    EXPECT_GT(result.size(), 0) << "widenPath returned empty result for: " << path;
+  }
+}
+
+TEST(FileSystemTest, widenPathCorrectnessAndOptimizations) {
+  // Test that optimizations don't break correctness
+  
+  // Test early return for short absolute paths
+  {
+    std::string shortAbsPath = "C:\\Windows\\System32\\test.exe";
+    llvm::SmallVector<wchar_t, 260> result;
+    std::error_code ec = llvm::sys::path::widenPath(shortAbsPath, result);
+    EXPECT_FALSE(ec);
+    EXPECT_GT(result.size(), 0);
+    
+    // Convert back to check correctness
+    llvm::SmallVector<char, 260> backConverted;
+    llvm::sys::windows::UTF16ToUTF8(result.data(), result.size(), backConverted);
+    std::string converted(backConverted.data(), backConverted.size());
+    EXPECT_EQ(converted, shortAbsPath);
+  }
+  
+  // Test relative path handling
+  {
+    std::string relPath = "..\\test.txt";
+    llvm::SmallVector<wchar_t, 260> result;
+    std::error_code ec = llvm::sys::path::widenPath(relPath, result);
+    EXPECT_FALSE(ec);
+    EXPECT_GT(result.size(), 0);
+  }
+  
+  // Test long path with \\?\ prefix
+  {
+    std::string longPath = "C:\\very\\long\\path\\that\\exceeds\\the\\normal\\MAX_PATH\\limit\\and\\requires\\special\\handling\\with\\the\\long\\path\\prefix\\to\\work\\correctly\\on\\windows\\systems\\and\\should\\trigger\\the\\long\\path\\support\\mechanism\\file.txt";
+    llvm::SmallVector<wchar_t, 1024> result;
+    std::error_code ec = llvm::sys::path::widenPath(longPath, result);
+    EXPECT_FALSE(ec);
+    EXPECT_GT(result.size(), 0);
+    
+    // Should have \\?\ prefix for long paths
+    if (result.size() >= 4) {
+      std::wstring prefix(result.data(), 4);
+      EXPECT_EQ(prefix, L"\\\\?\\") << "Long path should have \\\\?\\ prefix";
+    }
+  }
+  
+  // Test path canonicalization
+  {
+    std::string pathWithDots = "C:\\Windows\\..\\Program Files\\..\\Windows\\System32\\kernel32.dll";
+    llvm::SmallVector<wchar_t, 1024> result;
+    std::error_code ec = llvm::sys::path::widenPath(pathWithDots, result);
+    EXPECT_FALSE(ec);
+    EXPECT_GT(result.size(), 0);
+  }
+}
+#endif // _WIN32
 
 }
